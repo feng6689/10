@@ -4,7 +4,7 @@ from utils import convert_to_gray
 
 
 class ImprovedGeometricDetector:
-    def __init__(self, min_area=100, max_area=50000):
+    def __init__(self, min_area=50, max_area=100000):
         """
         初始化改进的几何物体检测器
         :param min_area: 最小检测面积
@@ -21,83 +21,95 @@ class ImprovedGeometricDetector:
         except AttributeError:
             return cv2.ORB_create(nfeatures=2000)
     
-    def preprocess_image(self, image):
+    def preprocess_image_multi_level(self, image):
         """
-        预处理图像，使用更稳定的方法
+        多级预处理，使用多种方法提高检测率
         """
         gray = convert_to_gray(image)
         
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        preprocessed_list = []
         
-        edges = cv2.Canny(blurred, 50, 150)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges1 = cv2.Canny(blurred, 20, 80)
+        preprocessed_list.append(('canny_low', edges1))
         
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=1)
-        edges = cv2.erode(edges, kernel, iterations=1)
+        edges2 = cv2.Canny(blurred, 50, 150)
+        preprocessed_list.append(('canny_medium', edges2))
         
-        return edges
+        edges3 = cv2.Canny(blurred, 100, 200)
+        preprocessed_list.append(('canny_high', edges3))
+        
+        _, thresh1 = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
+        edges4 = cv2.Canny(thresh1, 20, 80)
+        preprocessed_list.append(('binary_canny', edges4))
+        
+        _, thresh2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        edges5 = cv2.Canny(thresh2, 20, 80)
+        preprocessed_list.append(('otsu_canny', edges5))
+        
+        adapt_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                              cv2.THRESH_BINARY, 11, 2)
+        edges6 = cv2.Canny(adapt_thresh, 20, 80)
+        preprocessed_list.append(('adaptive_canny', edges6))
+        
+        return preprocessed_list
     
-    def find_contours(self, image):
+    def find_contours_multi_level(self, image):
         """
-        查找轮廓，使用更稳定的方法
+        多级轮廓检测，使用多种预处理方法
         """
-        edges = self.preprocess_image(image)
-        
-        contours, hierarchy = cv2.findContours(
-            edges, 
-            cv2.RETR_EXTERNAL, 
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-        
-        valid_contours = []
+        all_contours = []
         h, w = image.shape[:2]
         
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            
-            if area < self.min_area or area > self.max_area:
-                continue
-            
-            x, y, cnt_w, cnt_h = cv2.boundingRect(cnt)
-            
-            if cnt_w < 10 or cnt_h < 10:
-                continue
-            
-            is_edge = (x <= 2 or y <= 2 or x + cnt_w >= w - 2 or y + cnt_h >= h - 2)
-            
-            valid_contours.append({
-                'contour': cnt,
-                'area': area,
-                'bbox': (x, y, cnt_w, cnt_h),
-                'is_edge': is_edge
-            })
+        preprocessed_list = self.preprocess_image_multi_level(image)
         
-        valid_contours = self._remove_duplicate_contours(valid_contours)
-        
-        return valid_contours
-    
-    def _remove_duplicate_contours(self, contours, iou_threshold=0.6):
-        """
-        去除重复的轮廓
-        """
-        if len(contours) <= 1:
-            return contours
-        
-        sorted_contours = sorted(contours, key=lambda x: x['area'], reverse=True)
-        
-        keep = []
-        while sorted_contours:
-            current = sorted_contours.pop(0)
-            keep.append(current)
+        for method_name, preprocessed in preprocessed_list:
+            kernel = np.ones((2, 2), np.uint8)
+            dilated = cv2.dilate(preprocessed, kernel, iterations=1)
+            eroded = cv2.erode(dilated, kernel, iterations=1)
             
-            remaining = []
-            for cnt in sorted_contours:
-                iou = self._compute_bbox_iou(current['bbox'], cnt['bbox'])
-                if iou < iou_threshold:
-                    remaining.append(cnt)
-            sorted_contours = remaining
+            contours, hierarchy = cv2.findContours(
+                eroded, 
+                cv2.RETR_EXTERNAL, 
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                
+                if area < self.min_area or area > self.max_area:
+                    continue
+                
+                x, y, cnt_w, cnt_h = cv2.boundingRect(cnt)
+                
+                if cnt_w < 8 or cnt_h < 8:
+                    continue
+                
+                is_edge = (x <= 5 or y <= 5 or x + cnt_w >= w - 5 or y + cnt_h >= h - 5)
+                
+                contour_info = {
+                    'contour': cnt,
+                    'area': area,
+                    'bbox': (x, y, cnt_w, cnt_h),
+                    'is_edge': is_edge,
+                    'method': method_name
+                }
+                
+                is_duplicate = False
+                for existing in all_contours:
+                    iou = self._compute_bbox_iou(contour_info['bbox'], existing['bbox'])
+                    if iou > 0.5:
+                        is_duplicate = True
+                        if contour_info['area'] > existing['area']:
+                            existing.update(contour_info)
+                        break
+                
+                if not is_duplicate:
+                    all_contours.append(contour_info)
         
-        return keep
+        print(f"  从 {len(preprocessed_list)} 种预处理方法中找到 {len(all_contours)} 个唯一轮廓")
+        
+        return all_contours
     
     def _compute_bbox_iou(self, box1, box2):
         """
@@ -188,7 +200,7 @@ class ImprovedGeometricDetector:
         
         distance = np.linalg.norm(feat1 - feat2)
         
-        sigma = 2.0
+        sigma = 3.0
         similarity = np.exp(-distance ** 2 / (2 * sigma ** 2))
         
         return max(0.0, min(1.0, similarity))
@@ -208,7 +220,7 @@ class ImprovedGeometricDetector:
         return max(0.0, min(1.0, similarity))
     
     def compute_overall_similarity(self, shape_sim, color_sim,
-                                     shape_weight=0.7, color_weight=0.3):
+                                     shape_weight=0.6, color_weight=0.4):
         """
         计算综合相似度
         """
@@ -226,9 +238,7 @@ class ImprovedGeometricDetector:
         for img_idx, image in enumerate(images):
             print(f"\n  处理图片 {img_idx + 1}...")
             
-            contour_info_list = self.find_contours(image)
-            
-            print(f"  找到 {len(contour_info_list)} 个有效轮廓")
+            contour_info_list = self.find_contours_multi_level(image)
             
             for info in contour_info_list:
                 cnt = info['contour']
@@ -251,9 +261,10 @@ class ImprovedGeometricDetector:
         print(f"\n从 {len(images)} 张图片中提取了 {len(all_objects)} 个几何物体")
         return all_objects
     
-    def cluster_objects(self, objects, similarity_threshold=0.7):
+    def cluster_objects(self, objects, similarity_threshold=0.5):
         """
         对物体进行聚类，找出同类几何物体
+        降低阈值以增加聚类数量
         """
         if len(objects) == 0:
             return []
@@ -291,13 +302,14 @@ class ImprovedGeometricDetector:
             return clusters[0]
         return []
     
-    def detect_objects_in_image(self, image, source_img_idx, reference_objects, similarity_threshold=0.6):
+    def detect_objects_in_image(self, image, source_img_idx, reference_objects, similarity_threshold=0.4):
         """
         在单张图片中检测与参考物体相似的几何物体
+        降低阈值以增加检测数量
         """
         detections = []
         
-        contour_info_list = self.find_contours(image)
+        contour_info_list = self.find_contours_multi_level(image)
         
         for info in contour_info_list:
             cnt = info['contour']
@@ -314,6 +326,9 @@ class ImprovedGeometricDetector:
                 shape_sim = self.compute_shape_similarity(shape_features, ref_obj['shape_features'])
                 color_sim = self.compute_color_similarity(color_features, ref_obj['color_features'])
                 overall_sim = self.compute_overall_similarity(shape_sim, color_sim)
+                
+                if info['is_edge']:
+                    overall_sim = overall_sim * 0.95
                 
                 if overall_sim > max_similarity:
                     max_similarity = overall_sim
@@ -334,9 +349,10 @@ class ImprovedGeometricDetector:
         
         return detections
     
-    def _remove_duplicate_detections(self, detections, iou_threshold=0.5):
+    def _remove_duplicate_detections(self, detections, iou_threshold=0.4):
         """
         去除重复的检测结果
+        降低IoU阈值以保留更多检测
         """
         if len(detections) == 0:
             return []
@@ -359,7 +375,7 @@ class ImprovedGeometricDetector:
     
     def annotate_image(self, image, detections):
         """
-        在图像上标注检测结果（仅使用英文，避免乱码）
+        在图像上标注检测结果
         """
         annotated = image.copy()
         
@@ -379,12 +395,13 @@ class ImprovedGeometricDetector:
         return annotated
 
 
-def detect_similar_objects(images, similarity_threshold=0.6, min_area=100, max_area=50000):
+def detect_similar_objects(images, similarity_threshold=0.4, min_area=50, max_area=100000):
     """
     检测所有图片中的同类几何物体
+    降低参数以增加检测数量
     :param images: 原始图片列表
-    :param similarity_threshold: 相似度阈值（提高以减少误检）
-    :param min_area: 最小检测面积
+    :param similarity_threshold: 相似度阈值（降低以增加检测）
+    :param min_area: 最小检测面积（降低以检测更小的物体）
     :param max_area: 最大检测面积
     :return: (所有检测结果列表, 标注后的图片列表, 参考物体列表)
     """
@@ -403,15 +420,15 @@ def detect_similar_objects(images, similarity_threshold=0.6, min_area=100, max_a
         return [], [], []
     
     print("\n[步骤2] 聚类找出同类几何物体...")
-    print(f"  聚类相似度阈值: 0.7")
-    reference_cluster = detector.cluster_objects(all_objects, similarity_threshold=0.7)
+    print(f"  聚类相似度阈值: 0.5")
+    reference_cluster = detector.cluster_objects(all_objects, similarity_threshold=0.5)
     
     if len(reference_cluster) == 0:
         print("警告: 未找到同类几何物体（需要至少2个相似物体）")
         return [], [], []
     
     print(f"\n[步骤3] 以最大聚类（{len(reference_cluster)}个物体）为参考，检测所有图片...")
-    print(f"  检测相似度阈值: {similarity_threshold} (值越高检测越严格)")
+    print(f"  检测相似度阈值: {similarity_threshold} (值越低检测越多)")
     
     all_detections = []
     annotated_images = []
