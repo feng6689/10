@@ -17,23 +17,23 @@ class PanoramaStitcher:
         """创建特征检测器"""
         if self.detector_type == 'SIFT':
             try:
-                return cv2.SIFT_create(nfeatures=10000, contrastThreshold=0.01, edgeThreshold=10)
+                return cv2.SIFT_create(nfeatures=20000, contrastThreshold=0.005, edgeThreshold=20)
             except AttributeError:
                 print("警告: SIFT不可用，使用ORB代替")
-                return cv2.ORB_create(nfeatures=10000)
+                return cv2.ORB_create(nfeatures=20000)
         elif self.detector_type == 'ORB':
-            return cv2.ORB_create(nfeatures=10000, scoreType=cv2.ORB_FAST_SCORE)
+            return cv2.ORB_create(nfeatures=20000, scoreType=cv2.ORB_FAST_SCORE)
         else:
             raise ValueError(f"不支持的检测器: {self.detector_type}")
     
     def _create_matcher(self):
         """创建特征匹配器"""
         if self.detector_type == 'SIFT':
-            index_params = dict(algorithm=1, trees=5)
-            search_params = dict(checks=100)
+            index_params = dict(algorithm=1, trees=10)
+            search_params = dict(checks=200)
             return cv2.FlannBasedMatcher(index_params, search_params)
         else:
-            return cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            return cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
     
     def detect_features(self, image):
         """检测特征点和描述符"""
@@ -41,9 +41,9 @@ class PanoramaStitcher:
         keypoints, descriptors = self.detector.detectAndCompute(gray, None)
         return keypoints, descriptors
     
-    def match_features(self, desc1, desc2, ratio_thresh=0.7):
+    def match_features(self, desc1, desc2, ratio_thresh=0.8):
         """
-        特征匹配，使用Lowe's ratio test
+        特征匹配，使用Lowe's ratio test，降低阈值以获得更多匹配
         """
         if desc1 is None or desc2 is None:
             return []
@@ -61,18 +61,22 @@ class PanoramaStitcher:
                         if m.distance < ratio_thresh * n.distance:
                             good_matches.append(m)
             else:
-                matches = self.matcher.match(desc1, desc2)
-                good_matches = sorted(matches, key=lambda x: x.distance)
+                matches = self.matcher.knnMatch(desc1, desc2, k=2)
+                for match_pair in matches:
+                    if len(match_pair) == 2:
+                        m, n = match_pair
+                        if m.distance < ratio_thresh * n.distance:
+                            good_matches.append(m)
         except Exception as e:
             print(f"特征匹配错误: {e}")
         
         return good_matches
     
-    def estimate_homography(self, kp1, kp2, matches, ransac_thresh=5.0):
+    def estimate_homography(self, kp1, kp2, matches, ransac_thresh=3.0):
         """
-        估计单应性矩阵
+        估计单应性矩阵，降低RANSAC阈值
         """
-        if len(matches) < 8:
+        if len(matches) < 4:
             return None, None
         
         src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
@@ -85,7 +89,7 @@ class PanoramaStitcher:
     def check_homography_validity(self, H, img1_shape, img2_shape):
         """
         检查单应性矩阵是否合理
-        确保图像不会被过度扭曲
+        放宽条件，允许更多变换
         """
         if H is None:
             return False
@@ -106,9 +110,9 @@ class PanoramaStitcher:
         width = np.max(x_coords) - np.min(x_coords)
         height = np.max(y_coords) - np.min(y_coords)
         
-        if width < 0.2 * w1 or width > 5 * w1:
+        if width < 0.1 * w1 or width > 10 * w1:
             return False
-        if height < 0.2 * h1 or height > 5 * h1:
+        if height < 0.1 * h1 or height > 10 * h1:
             return False
         
         return True
@@ -138,9 +142,9 @@ class PanoramaStitcher:
         """
         return cv2.warpPerspective(image, H, output_size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     
-    def create_alpha_mask(self, shape, blend_width=100):
+    def create_alpha_mask(self, shape, blend_width=150):
         """
-        创建alpha遮罩用于图像融合
+        创建alpha遮罩用于图像融合，增加融合宽度
         """
         h, w = shape[:2]
         mask = np.ones((h, w), dtype=np.float32)
@@ -157,9 +161,9 @@ class PanoramaStitcher:
         
         return mask
     
-    def blend_images(self, img1, img2, mask1=None, mask2=None):
+    def blend_images_with_overlap(self, img1, img2, mask1=None, mask2=None):
         """
-        无缝图像融合
+        带重叠区域的图像融合
         """
         if mask1 is None:
             mask1 = np.ones(img1.shape[:2], dtype=np.float32)
@@ -169,23 +173,36 @@ class PanoramaStitcher:
             mask2 = np.ones(img2.shape[:2], dtype=np.float32)
             mask2[np.all(img2 == [0, 0, 0], axis=2)] = 0
         
-        mask_sum = mask1 + mask2
-        mask_sum[mask_sum == 0] = 1
+        overlap = (mask1 > 0) & (mask2 > 0)
+        only1 = (mask1 > 0) & (mask2 == 0)
+        only2 = (mask1 == 0) & (mask2 > 0)
         
-        weight1 = mask1 / mask_sum
-        weight2 = mask2 / mask_sum
+        blended = np.zeros_like(img1, dtype=np.uint8)
         
-        weight1 = np.stack([weight1] * 3, axis=-1)
-        weight2 = np.stack([weight2] * 3, axis=-1)
+        blended[only1] = img1[only1]
+        blended[only2] = img2[only2]
         
-        blended = (img1.astype(np.float32) * weight1 + img2.astype(np.float32) * weight2).astype(np.uint8)
+        if np.any(overlap):
+            weight1 = mask1[overlap]
+            weight2 = mask2[overlap]
+            weight_sum = weight1 + weight2
+            weight_sum[weight_sum == 0] = 1
+            
+            weight1 = weight1 / weight_sum
+            weight2 = weight2 / weight_sum
+            
+            weight1_3d = np.stack([weight1] * 3, axis=-1)
+            weight2_3d = np.stack([weight2] * 3, axis=-1)
+            
+            blended[overlap] = (img1[overlap].astype(np.float32) * weight1_3d + 
+                               img2[overlap].astype(np.float32) * weight2_3d).astype(np.uint8)
         
         return blended
     
-    def stitch_left_to_right(self, img_left, img_right):
+    def stitch_left_to_right_improved(self, img_left, img_right):
         """
-        严格从左到右拼接两张图片
-        左图保持不动，右图变换到左图的坐标系
+        改进的从左到右拼接
+        尝试多种匹配策略
         """
         print(f"  尝试左→右拼接 (左图: {img_left.shape[1]}x{img_left.shape[0]}, 右图: {img_right.shape[1]}x{img_right.shape[0]})")
         
@@ -193,35 +210,57 @@ class PanoramaStitcher:
         kp_right, desc_right = self.detect_features(img_right)
         
         if desc_left is None or desc_right is None:
-            print("  警告: 无法检测到特征点，使用直接拼接")
-            return self.stitch_direct_horizontal(img_left, img_right)
+            print("  警告: 无法检测到特征点，使用智能直接拼接")
+            return self.stitch_smart_direct(img_left, img_right)
         
         print(f"  左图特征点: {len(kp_left)}, 右图特征点: {len(kp_right)}")
         
-        matches = self.match_features(desc_right, desc_left, ratio_thresh=0.7)
-        print(f"  匹配点数量: {len(matches)}")
+        matches_forward = self.match_features(desc_right, desc_left, ratio_thresh=0.8)
+        print(f"  正向匹配点 (右→左): {len(matches_forward)}")
         
-        if len(matches) < 8:
-            print("  警告: 匹配点不足，使用直接拼接")
-            return self.stitch_direct_horizontal(img_left, img_right)
+        if len(matches_forward) >= 4:
+            H, mask = self.estimate_homography(kp_right, kp_left, matches_forward, ransac_thresh=3.0)
+            
+            if H is not None and self.check_homography_validity(H, img_right.shape, img_left.shape):
+                inlier_count = np.sum(mask) if mask is not None else 0
+                print(f"  估计单应性矩阵成功，内点数量: {inlier_count}")
+                
+                if inlier_count >= 8:
+                    return self._warp_and_blend(img_left, img_right, H)
         
-        H, mask = self.estimate_homography(kp_right, kp_left, matches, ransac_thresh=5.0)
+        print("  特征匹配不够好，尝试反向匹配...")
+        matches_backward = self.match_features(desc_left, desc_right, ratio_thresh=0.8)
+        print(f"  反向匹配点 (左→右): {len(matches_backward)}")
         
-        if H is None:
-            print("  警告: 无法估计单应性矩阵，使用直接拼接")
-            return self.stitch_direct_horizontal(img_left, img_right)
+        if len(matches_backward) >= 4:
+            H, mask = self.estimate_homography(kp_left, kp_right, matches_backward, ransac_thresh=3.0)
+            
+            if H is not None:
+                try:
+                    H_inv = np.linalg.inv(H)
+                    if self.check_homography_validity(H_inv, img_right.shape, img_left.shape):
+                        inlier_count = np.sum(mask) if mask is not None else 0
+                        print(f"  反向单应性矩阵成功，内点数量: {inlier_count}")
+                        
+                        if inlier_count >= 8:
+                            return self._warp_and_blend(img_left, img_right, H_inv)
+                except:
+                    pass
         
-        if not self.check_homography_validity(H, img_right.shape, img_left.shape):
-            print("  警告: 单应性矩阵不合理，使用直接拼接")
-            return self.stitch_direct_horizontal(img_left, img_right)
-        
+        print("  特征匹配不够好，使用智能直接拼接")
+        return self.stitch_smart_direct(img_left, img_right)
+    
+    def _warp_and_blend(self, img_left, img_right, H_right_to_left):
+        """
+        使用单应性矩阵变换并融合
+        """
         h_left, w_left = img_left.shape[:2]
         h_right, w_right = img_right.shape[:2]
         
         corners_right = np.float32([[0, 0], [0, h_right], [w_right, h_right], [w_right, 0]]).reshape(-1, 1, 2)
         corners_left = np.float32([[0, 0], [0, h_left], [w_left, h_left], [w_left, 0]]).reshape(-1, 1, 2)
         
-        corners_right_warped = cv2.perspectiveTransform(corners_right, H)
+        corners_right_warped = cv2.perspectiveTransform(corners_right, H_right_to_left)
         all_corners = np.concatenate((corners_left, corners_right_warped), axis=0)
         
         [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
@@ -231,7 +270,7 @@ class PanoramaStitcher:
                                 [0, 1, -y_min],
                                 [0, 0, 1]])
         
-        H_translated = translation.dot(H)
+        H_translated = translation.dot(H_right_to_left)
         output_size = (x_max - x_min, y_max - y_min)
         
         img_right_warped = self.warp_image(img_right, H_translated, output_size)
@@ -239,23 +278,24 @@ class PanoramaStitcher:
         result = np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
         result[-y_min:-y_min+h_left, -x_min:-x_min+w_left] = img_left
         
-        alpha_mask_right = self.create_alpha_mask(img_right.shape, blend_width=100)
+        alpha_mask_right = self.create_alpha_mask(img_right.shape, blend_width=150)
         alpha_mask_warped = cv2.warpPerspective(alpha_mask_right, H_translated, output_size)
         
         alpha_mask_result = np.zeros(result.shape[:2], dtype=np.float32)
         alpha_mask_result[-y_min:-y_min+h_left, -x_min:-x_min+w_left] = 1.0
         
-        final = self.blend_images(img_right_warped, result, alpha_mask_warped, alpha_mask_result)
+        final = self.blend_images_with_overlap(img_right_warped, result, alpha_mask_warped, alpha_mask_result)
         
         print(f"  拼接成功，输出尺寸: {output_size[0]}x{output_size[1]}")
         
         return final
     
-    def stitch_direct_horizontal(self, img_left, img_right, overlap_est=0.15):
+    def stitch_smart_direct(self, img_left, img_right):
         """
-        直接水平拼接（无特征匹配），严格从左到右
+        智能直接拼接
+        尝试估计重叠区域
         """
-        print("  使用直接水平拼接")
+        print("  使用智能直接拼接")
         
         h_left, w_left = img_left.shape[:2]
         h_right, w_right = img_right.shape[:2]
@@ -275,25 +315,74 @@ class PanoramaStitcher:
         w_left_resized = img_left.shape[1]
         w_right_resized = img_right.shape[1]
         
-        overlap_pixels = int(min(w_left_resized, w_right_resized) * overlap_est)
+        overlap_estimates = [0.1, 0.15, 0.2, 0.25, 0.3]
+        best_result = None
+        best_score = -1
         
-        if overlap_pixels > 0 and w_left_resized > overlap_pixels and w_right_resized > overlap_pixels:
-            left_part = img_left[:, :-overlap_pixels]
-            right_part = img_right[:, overlap_pixels:]
-            overlap_left = img_left[:, -overlap_pixels:]
-            overlap_right = img_right[:, :overlap_pixels]
+        for overlap_ratio in overlap_estimates:
+            result = self._stitch_with_overlap(img_left, img_right, overlap_ratio)
             
-            blend_mask = np.linspace(1, 0, overlap_pixels).reshape(1, -1, 1)
-            blended_overlap = (overlap_left.astype(np.float32) * blend_mask + 
-                             overlap_right.astype(np.float32) * (1 - blend_mask)).astype(np.uint8)
-            
-            result = np.hstack([left_part, blended_overlap, right_part])
-        else:
-            result = np.hstack([img_left, img_right])
+            if result is not None:
+                score = self._evaluate_stitch_quality(img_left, img_right, result, overlap_ratio)
+                if score > best_score:
+                    best_score = score
+                    best_result = result
         
-        print(f"  直接拼接完成，输出尺寸: {result.shape[1]}x{result.shape[0]}")
+        if best_result is not None:
+            print(f"  智能直接拼接完成，输出尺寸: {best_result.shape[1]}x{best_result.shape[0]}")
+            return best_result
         
+        result = np.hstack([img_left, img_right])
+        print(f"  简单拼接完成，输出尺寸: {result.shape[1]}x{result.shape[0]}")
         return result
+    
+    def _stitch_with_overlap(self, img_left, img_right, overlap_ratio):
+        """
+        使用指定的重叠比例拼接
+        """
+        w_left = img_left.shape[1]
+        w_right = img_right.shape[1]
+        
+        overlap_pixels = int(min(w_left, w_right) * overlap_ratio)
+        
+        if overlap_pixels <= 0 or w_left <= overlap_pixels or w_right <= overlap_pixels:
+            return None
+        
+        left_part = img_left[:, :-overlap_pixels]
+        right_part = img_right[:, overlap_pixels:]
+        overlap_left = img_left[:, -overlap_pixels:]
+        overlap_right = img_right[:, :overlap_pixels]
+        
+        blend_mask = np.linspace(1, 0, overlap_pixels).reshape(1, -1, 1)
+        blended_overlap = (overlap_left.astype(np.float32) * blend_mask + 
+                         overlap_right.astype(np.float32) * (1 - blend_mask)).astype(np.uint8)
+        
+        result = np.hstack([left_part, blended_overlap, right_part])
+        return result
+    
+    def _evaluate_stitch_quality(self, img_left, img_right, result, overlap_ratio):
+        """
+        评估拼接质量
+        """
+        h, w_left = img_left.shape[:2]
+        overlap_pixels = int(min(w_left, img_right.shape[1]) * overlap_ratio)
+        
+        if overlap_pixels <= 0:
+            return 0
+        
+        gray_left = convert_to_gray(img_left)
+        gray_right = convert_to_gray(img_right)
+        
+        overlap_left_region = gray_left[:, -overlap_pixels:]
+        overlap_right_region = gray_right[:, :overlap_pixels]
+        
+        if overlap_left_region.shape != overlap_right_region.shape:
+            return 0
+        
+        similarity = cv2.matchTemplate(overlap_left_region, overlap_right_region, cv2.TM_CCOEFF_NORMED)
+        max_sim = np.max(similarity) if similarity.size > 0 else 0
+        
+        return max_sim
     
     def stitch_multiple_left_to_right(self, images):
         """
@@ -306,16 +395,17 @@ class PanoramaStitcher:
             return images[0]
         
         print(f"\n开始从左到右拼接 {len(images)} 张图片...")
+        print(f"拼接顺序: 图片1 → 图片2 → 图片3 → 图片4 → 图片5")
         
         result = images[0]
         for i in range(1, len(images)):
             print(f"\n正在拼接第 {i+1} 张图片到结果中...")
             
-            stitched = self.stitch_left_to_right(result, images[i])
+            stitched = self.stitch_left_to_right_improved(result, images[i])
             
             if stitched is None:
-                print(f"警告: 无法拼接第 {i+1} 张图片，跳过")
-                continue
+                print(f"警告: 无法拼接第 {i+1} 张图片，使用简单拼接")
+                stitched = np.hstack([result, images[i]])
             
             result = stitched
             print(f"当前结果尺寸: {result.shape[1]} x {result.shape[0]}")
