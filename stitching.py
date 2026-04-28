@@ -48,22 +48,19 @@ class PanoramaStitcher:
         if desc1 is None or desc2 is None:
             return []
         
-        if self.detector_type == 'SIFT':
+        if len(desc1) < 2 or len(desc2) < 2:
+            return []
+        
+        good_matches = []
+        try:
             matches = self.matcher.knnMatch(desc1, desc2, k=2)
-            good_matches = []
             for match_pair in matches:
                 if len(match_pair) == 2:
                     m, n = match_pair
                     if m.distance < ratio_thresh * n.distance:
                         good_matches.append(m)
-        else:
-            matches = self.matcher.knnMatch(desc1, desc2, k=2)
-            good_matches = []
-            for match_pair in matches:
-                if len(match_pair) == 2:
-                    m, n = match_pair
-                    if m.distance < ratio_thresh * n.distance:
-                        good_matches.append(m)
+        except Exception as e:
+            print(f"特征匹配错误: {e}")
         
         return good_matches
     
@@ -106,32 +103,46 @@ class PanoramaStitcher:
         """
         return cv2.warpPerspective(image, H, output_size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     
-    def create_mask(self, image, H, output_size, offset):
+    def create_blend_mask(self, warped_shape, original_size, offset, blend_width=50):
         """
-        创建用于融合的mask
+        创建用于无缝融合的mask，使用线性渐变
         """
-        h, w = image.shape[:2]
+        h, w = warped_shape[:2]
         mask = np.ones((h, w), dtype=np.float32)
         
-        mask[:, :5] = np.linspace(0, 1, 5).reshape(1, -1)
-        mask[:, -5:] = np.linspace(1, 0, 5).reshape(1, -1)
-        mask[:5, :] = np.minimum(mask[:5, :], np.linspace(0, 1, 5).reshape(-1, 1))
-        mask[-5:, :] = np.minimum(mask[-5:, :], np.linspace(1, 0, 5).reshape(-1, 1))
+        x_off, y_off = offset
+        orig_w, orig_h = original_size
         
-        H_with_offset = np.array([[1, 0, offset[0]],
-                                   [0, 1, offset[1]],
-                                   [0, 0, 1]])
+        left_edge = x_off
+        right_edge = x_off + orig_w
+        top_edge = y_off
+        bottom_edge = y_off + orig_h
         
-        mask_warped = cv2.warpPerspective(mask, H_with_offset.dot(np.linalg.inv(H_with_offset[:2, :2])), 
-                                           output_size) if False else \
-                       cv2.warpPerspective(mask, H_with_offset, output_size, 
-                                          flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        if left_edge > 0:
+            for x in range(min(blend_width, left_edge)):
+                alpha = x / min(blend_width, left_edge)
+                mask[:, x] *= alpha
         
-        return mask_warped
+        if right_edge < w:
+            for x in range(max(0, w - blend_width), w):
+                alpha = (w - x - 1) / blend_width
+                mask[:, x] *= alpha
+        
+        if top_edge > 0:
+            for y in range(min(blend_width, top_edge)):
+                alpha = y / min(blend_width, top_edge)
+                mask[y, :] *= alpha
+        
+        if bottom_edge < h:
+            for y in range(max(0, h - blend_width), h):
+                alpha = (h - y - 1) / blend_width
+                mask[y, :] *= alpha
+        
+        return mask
     
-    def blend_images(self, img1, img2, mask1=None, mask2=None):
+    def blend_images_seamless(self, img1, img2, mask1=None, mask2=None):
         """
-        图像融合（线性混合）
+        无缝图像融合，使用加权平均
         """
         if mask1 is None:
             mask1 = np.ones(img1.shape[:2], dtype=np.float32)
@@ -156,52 +167,69 @@ class PanoramaStitcher:
     
     def stitch_pair(self, img_left, img_right):
         """
-        拼接两张图片（左图和右图）
+        拼接两张图片（左图和右图），改进版
         """
         kp1, desc1 = self.detect_features(img_left)
         kp2, desc2 = self.detect_features(img_right)
         
         if desc1 is None or desc2 is None:
-            print("警告: 无法检测到特征点")
-            return None
+            print("警告: 无法检测到特征点，尝试直接水平拼接")
+            return self.stitch_direct_horizontal(img_left, img_right)
         
         matches = self.match_features(desc1, desc2, ratio_thresh=0.7)
-        print(f"找到 {len(matches)} 个匹配点")
+        print(f"找到 {len(matches)} 个匹配点 (左->右)")
         
         if len(matches) < 10:
-            print("警告: 匹配点太少，尝试反向匹配...")
-            matches = self.match_features(desc2, desc1, ratio_thresh=0.7)
-            print(f"反向匹配找到 {len(matches)} 个匹配点")
+            print(f"匹配点不足，尝试反向匹配...")
+            matches_rev = self.match_features(desc2, desc1, ratio_thresh=0.7)
+            print(f"反向匹配找到 {len(matches_rev)} 个匹配点 (右->左)")
             
-            if len(matches) < 10:
-                print("错误: 匹配点不足，无法拼接")
-                return None
+            if len(matches_rev) < 10:
+                print("匹配点仍然不足，尝试直接水平拼接")
+                return self.stitch_direct_horizontal(img_left, img_right)
             
-            H, mask = self.estimate_homography(kp2, kp1, matches, ransac_thresh=5.0)
+            H, mask = self.estimate_homography(kp2, kp1, matches_rev, ransac_thresh=5.0)
             if H is None:
-                print("错误: 无法估计单应性矩阵")
-                return None
+                print("错误: 无法估计单应性矩阵，尝试直接水平拼接")
+                return self.stitch_direct_horizontal(img_left, img_right)
             
             h1, w1 = img_right.shape[:2]
             h2, w2 = img_left.shape[:2]
             
-            H_translated, output_size, offset = self.get_warped_size(H, h1, w1)
+            corners1 = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+            corners2 = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
+            
+            corners1_warped = cv2.perspectiveTransform(corners1, H)
+            all_corners = np.concatenate((corners2, corners1_warped), axis=0)
+            
+            [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
+            [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+            
+            translation = np.array([[1, 0, -x_min],
+                                    [0, 1, -y_min],
+                                    [0, 0, 1]])
+            
+            H_translated = translation.dot(H)
+            output_size = (x_max - x_min, y_max - y_min)
             
             img_right_warped = self.warp_image(img_right, H_translated, output_size)
             
             result = np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
-            result[offset[1]:offset[1]+h2, offset[0]:offset[0]+w2] = img_left
+            result[-y_min:-y_min+h2, -x_min:-x_min+w2] = img_left
             
-            mask_warped = np.all(img_right_warped != [0, 0, 0], axis=2).astype(np.float32)
-            mask_result = np.all(result != [0, 0, 0], axis=2).astype(np.float32)
+            mask_warped = self.create_blend_mask(img_right_warped.shape, (w1, h1), (-x_min, -y_min))
+            mask_result = np.ones(result.shape[:2], dtype=np.float32)
+            mask_result[np.all(result == [0, 0, 0], axis=2)] = 0
             
-            final = self.blend_images(img_right_warped, result, mask_warped, mask_result)
+            final = self.blend_images_seamless(img_right_warped, result, mask_warped, mask_result)
             
+            return final
+        
         else:
             H, mask = self.estimate_homography(kp1, kp2, matches, ransac_thresh=5.0)
             if H is None:
-                print("错误: 无法估计单应性矩阵")
-                return None
+                print("错误: 无法估计单应性矩阵，尝试直接水平拼接")
+                return self.stitch_direct_horizontal(img_left, img_right)
             
             h1, w1 = img_left.shape[:2]
             h2, w2 = img_right.shape[:2]
@@ -227,12 +255,52 @@ class PanoramaStitcher:
             result = np.zeros((output_size[1], output_size[0], 3), dtype=np.uint8)
             result[-y_min:-y_min+h2, -x_min:-x_min+w2] = img_right
             
-            mask_warped = np.all(img_left_warped != [0, 0, 0], axis=2).astype(np.float32)
-            mask_result = np.all(result != [0, 0, 0], axis=2).astype(np.float32)
+            mask_warped = self.create_blend_mask(img_left_warped.shape, (w1, h1), (-x_min, -y_min))
+            mask_result = np.ones(result.shape[:2], dtype=np.float32)
+            mask_result[np.all(result == [0, 0, 0], axis=2)] = 0
             
-            final = self.blend_images(img_left_warped, result, mask_warped, mask_result)
+            final = self.blend_images_seamless(img_left_warped, result, mask_warped, mask_result)
+            
+            return final
+    
+    def stitch_direct_horizontal(self, img_left, img_right, overlap_est=0.2):
+        """
+        当特征匹配失败时，直接水平拼接（假设从左到右顺序）
+        """
+        print("使用直接水平拼接（无特征匹配）")
         
-        return final
+        h1, w1 = img_left.shape[:2]
+        h2, w2 = img_right.shape[:2]
+        
+        h_max = max(h1, h2)
+        
+        if h1 != h_max:
+            scale = h_max / h1
+            new_w = int(w1 * scale)
+            img_left = cv2.resize(img_left, (new_w, h_max))
+        
+        if h2 != h_max:
+            scale = h_max / h2
+            new_w = int(w2 * scale)
+            img_right = cv2.resize(img_right, (new_w, h_max))
+        
+        overlap_pixels = int(min(img_left.shape[1], img_right.shape[1]) * overlap_est)
+        
+        if overlap_pixels > 0:
+            left_part = img_left[:, :-overlap_pixels]
+            right_part = img_right[:, overlap_pixels:]
+            overlap_left = img_left[:, -overlap_pixels:]
+            overlap_right = img_right[:, :overlap_pixels]
+            
+            blend_mask = np.linspace(1, 0, overlap_pixels).reshape(1, -1, 1)
+            blended_overlap = (overlap_left.astype(np.float32) * blend_mask + 
+                             overlap_right.astype(np.float32) * (1 - blend_mask)).astype(np.uint8)
+            
+            result = np.hstack([left_part, blended_overlap, right_part])
+        else:
+            result = np.hstack([img_left, img_right])
+        
+        return result
     
     def stitch_multiple(self, images, order='left_to_right'):
         """
@@ -254,12 +322,8 @@ class PanoramaStitcher:
             stitched = self.stitch_pair(result, images[i])
             
             if stitched is None:
-                print(f"警告: 无法拼接第 {i+1} 张图片，尝试另一种方式...")
-                
-                stitched = self.stitch_pair(images[i], result)
-                if stitched is None:
-                    print(f"错误: 无法拼接第 {i+1} 张图片，跳过")
-                    continue
+                print(f"警告: 无法拼接第 {i+1} 张图片，尝试直接水平拼接")
+                stitched = self.stitch_direct_horizontal(result, images[i])
             
             result = stitched
             print(f"拼接后尺寸: {result.shape[1]} x {result.shape[0]}")
@@ -294,15 +358,19 @@ def stitch_opencv_builtin(images):
     """
     print("尝试使用OpenCV内置Stitcher...")
     
-    stitcher = cv2.Stitcher_create(mode=cv2.Stitcher_PANORAMA)
-    
-    status, panorama = stitcher.stitch(images)
-    
-    if status == cv2.Stitcher_OK:
-        print("OpenCV Stitcher拼接成功!")
-        return panorama
-    else:
-        print(f"OpenCV Stitcher失败，错误码: {status}")
+    try:
+        stitcher = cv2.Stitcher_create(mode=cv2.Stitcher_PANORAMA)
+        
+        status, panorama = stitcher.stitch(images)
+        
+        if status == cv2.Stitcher_OK:
+            print("OpenCV Stitcher拼接成功!")
+            return panorama
+        else:
+            print(f"OpenCV Stitcher失败，错误码: {status}")
+            return None
+    except Exception as e:
+        print(f"OpenCV Stitcher异常: {e}")
         return None
 
 
