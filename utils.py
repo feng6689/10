@@ -8,23 +8,34 @@ def load_image(image_path):
     """加载图片，返回BGR格式图像"""
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"图片不存在: {image_path}")
+    
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"无法加载图片: {image_path}")
+    
     return image
 
 
 def save_image(image_path, image):
     """保存图片"""
-    cv2.imwrite(image_path, image)
-    print(f"图片已保存: {image_path}")
+    try:
+        cv2.imwrite(image_path, image)
+        print(f"图片已保存: {image_path}")
+        return True
+    except Exception as e:
+        print(f"保存图片失败: {image_path}, 错误: {e}")
+        return False
 
 
 def load_images_from_paths(image_paths):
     """从路径列表加载多张图片"""
     images = []
     for path in image_paths:
-        images.append(load_image(path))
+        try:
+            img = load_image(path)
+            images.append(img)
+        except Exception as e:
+            print(f"警告: 无法加载图片 {path}: {e}")
     return images
 
 
@@ -64,19 +75,30 @@ def draw_detections(image, detections, draw_labels=True):
 
 def save_detections_to_json(detections, json_path):
     """保存检测结果到JSON文件"""
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(detections, f, indent=2, ensure_ascii=False)
-    print(f"检测结果已保存: {json_path}")
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(detections, f, indent=2, ensure_ascii=False)
+        print(f"检测结果已保存: {json_path}")
+        return True
+    except Exception as e:
+        print(f"保存JSON失败: {json_path}, 错误: {e}")
+        return False
 
 
 def load_detections_from_json(json_path):
     """从JSON文件加载检测结果"""
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"JSON文件不存在: {json_path}")
+    
     with open(json_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
 def resize_image(image, width=None, height=None, inter=cv2.INTER_AREA):
     """调整图像大小"""
+    if image is None:
+        return None
+    
     dim = None
     (h, w) = image.shape[:2]
     
@@ -96,6 +118,9 @@ def resize_image(image, width=None, height=None, inter=cv2.INTER_AREA):
 
 def convert_to_gray(image):
     """转换为灰度图"""
+    if image is None:
+        return None
+    
     if len(image.shape) == 3:
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return image
@@ -103,11 +128,18 @@ def convert_to_gray(image):
 
 def normalize_image(image):
     """归一化图像到0-255范围"""
+    if image is None:
+        return None
+    
     return cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
 
 
 def show_image(image, window_name="Image"):
     """显示图像（调试用）"""
+    if image is None:
+        print("警告: 图像为空，无法显示")
+        return
+    
     cv2.imshow(window_name, image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
