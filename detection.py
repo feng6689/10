@@ -32,36 +32,37 @@ class ImprovedGeometricDetector:
         
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges1 = cv2.Canny(blurred, 30, 100)
-        results.append(edges1)
+        results.append(('canny_30_100', edges1))
         
         edges2 = cv2.Canny(blurred, 50, 150)
-        results.append(edges2)
+        results.append(('canny_50_150', edges2))
         
         _, thresh1 = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
         edges3 = cv2.Canny(thresh1, 30, 100)
-        results.append(edges3)
+        results.append(('binary_canny', edges3))
         
         _, thresh2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         edges4 = cv2.Canny(thresh2, 30, 100)
-        results.append(edges4)
+        results.append(('otsu_canny', edges4))
         
         adapt_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                               cv2.THRESH_BINARY, 11, 2)
         edges5 = cv2.Canny(adapt_thresh, 30, 100)
-        results.append(edges5)
+        results.append(('adaptive_canny', edges5))
         
         return results
     
     def find_all_contours(self, image):
         """
-        使用多种预处理方法查找所有轮廓
+        使用多种预处理方法查找所有轮廓，并去重
         """
         all_contours = []
-        all_heirarchies = []
+        all_contour_info = []
         
         preprocessed_list = self.preprocess_multi_level(image)
+        h, w = image.shape[:2]
         
-        for preprocessed in preprocessed_list:
+        for method_name, preprocessed in preprocessed_list:
             kernel = np.ones((2, 2), np.uint8)
             dilated = cv2.dilate(preprocessed, kernel, iterations=1)
             eroded = cv2.erode(dilated, kernel, iterations=1)
@@ -73,18 +74,46 @@ class ImprovedGeometricDetector:
             )
             
             for i, cnt in enumerate(contours):
-                if cv2.contourArea(cnt) > self.min_area:
-                    is_duplicate = False
-                    for existing_cnt in all_contours:
-                        if self._are_contours_similar(cnt, existing_cnt):
-                            is_duplicate = True
-                            break
-                    if not is_duplicate:
-                        all_contours.append(cnt)
+                area = cv2.contourArea(cnt)
+                
+                if area < self.min_area or area > self.max_area:
+                    continue
+                
+                x, y, cnt_w, cnt_h = cv2.boundingRect(cnt)
+                
+                is_edge_object = (x == 0 or y == 0 or x + cnt_w >= w or y + cnt_h >= h)
+                
+                is_duplicate = False
+                for idx, existing_info in enumerate(all_contour_info):
+                    existing_cnt = existing_info['contour']
+                    existing_is_edge = existing_info['is_edge']
+                    
+                    if self._are_contours_similar(cnt, existing_cnt):
+                        if is_edge_object and not existing_is_edge:
+                            all_contours[idx] = cnt
+                            all_contour_info[idx] = {
+                                'contour': cnt,
+                                'area': area,
+                                'bbox': (x, y, cnt_w, cnt_h),
+                                'is_edge': is_edge_object
+                            }
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    all_contours.append(cnt)
+                    all_contour_info.append({
+                        'contour': cnt,
+                        'area': area,
+                        'bbox': (x, y, cnt_w, cnt_h),
+                        'is_edge': is_edge_object
+                    })
         
-        return all_contours
+        print(f"  从 {len(preprocessed_list)} 种预处理方法中找到 {len(all_contours)} 个唯一轮廓")
+        
+        return all_contours, all_contour_info
     
-    def _are_contours_similar(self, cnt1, cnt2, iou_threshold=0.7):
+    def _are_contours_similar(self, cnt1, cnt2, iou_threshold=0.6):
         """检查两个轮廓是否相似（基于IoU）"""
         x1, y1, w1, h1 = cv2.boundingRect(cnt1)
         x2, y2, w2, h2 = cv2.boundingRect(cnt2)
@@ -125,14 +154,22 @@ class ImprovedGeometricDetector:
         circularity = 4 * np.pi * area / (perimeter ** 2) if perimeter > 0 else 0
         
         if len(contour) >= 5:
-            (x_ell, y_ell), (MA, ma), angle = cv2.fitEllipse(contour)
-            eccentricity = np.sqrt(1 - (min(MA, ma) / max(MA, ma)) ** 2) if max(MA, ma) > 0 else 0
+            try:
+                (x_ell, y_ell), (MA, ma), angle = cv2.fitEllipse(contour)
+                eccentricity = np.sqrt(1 - (min(MA, ma) / max(MA, ma)) ** 2) if max(MA, ma) > 0 else 0
+            except:
+                eccentricity = 0.5
         else:
             eccentricity = 0.5
         
         aspect_ratio = float(w) / h if h > 0 else 1.0
         
-        features.extend([extent, circularity, eccentricity, aspect_ratio])
+        solidity = 0.0
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = float(area) / hull_area if hull_area > 0 else 0
+        
+        features.extend([extent, circularity, eccentricity, aspect_ratio, solidity])
         
         return np.array(features)
     
@@ -202,7 +239,7 @@ class ImprovedGeometricDetector:
         
         distance = np.linalg.norm(feat1 - feat2)
         
-        sigma = 5.0
+        sigma = 3.0
         similarity = np.exp(-distance ** 2 / (2 * sigma ** 2))
         
         return max(0.0, min(1.0, similarity))
@@ -260,13 +297,12 @@ class ImprovedGeometricDetector:
         all_objects = []
         
         for img_idx, image in enumerate(images):
-            contours = self.find_all_contours(image)
+            print(f"\n  处理图片 {img_idx + 1}...")
             
-            for cnt_idx, cnt in enumerate(contours):
-                area = cv2.contourArea(cnt)
-                
-                if area < self.min_area or area > self.max_area:
-                    continue
+            contours, contour_info_list = self.find_all_contours(image)
+            
+            for cnt_idx, (cnt, info) in enumerate(zip(contours, contour_info_list)):
+                area = info['area']
                 
                 shape_features = self.get_shape_features(cnt)
                 color_features = self.get_color_features(image, cnt)
@@ -280,16 +316,18 @@ class ImprovedGeometricDetector:
                     'bbox': bbox,
                     'area': area,
                     'source_img': img_idx,
-                    'contour': cnt
+                    'contour': cnt,
+                    'is_edge': info['is_edge']
                 }
                 all_objects.append(obj)
         
-        print(f"从 {len(images)} 张图片中提取了 {len(all_objects)} 个几何物体")
+        print(f"\n从 {len(images)} 张图片中提取了 {len(all_objects)} 个几何物体")
         return all_objects
     
     def cluster_objects(self, objects, similarity_threshold=0.6):
         """
         对物体进行聚类，找出同类几何物体
+        使用改进的聚类算法
         """
         if len(objects) == 0:
             return []
@@ -300,20 +338,13 @@ class ImprovedGeometricDetector:
             matched = False
             
             for cluster in clusters:
-                ref_obj = cluster[0]
+                avg_shape = np.mean([o['shape_features'] for o in cluster], axis=0)
+                avg_color = np.mean([o['color_features'] for o in cluster], axis=0)
+                avg_sift = np.mean([o['sift_features'] for o in cluster], axis=0)
                 
-                shape_sim = self.compute_shape_similarity(
-                    obj['shape_features'], 
-                    ref_obj['shape_features']
-                )
-                color_sim = self.compute_color_similarity(
-                    obj['color_features'], 
-                    ref_obj['color_features']
-                )
-                sift_sim = self.compute_sift_similarity(
-                    obj['sift_features'], 
-                    ref_obj['sift_features']
-                )
+                shape_sim = self.compute_shape_similarity(obj['shape_features'], avg_shape)
+                color_sim = self.compute_color_similarity(obj['color_features'], avg_color)
+                sift_sim = self.compute_sift_similarity(obj['sift_features'], avg_sift)
                 overall_sim = self.compute_overall_similarity(shape_sim, color_sim, sift_sim)
                 
                 if overall_sim >= similarity_threshold:
@@ -342,13 +373,12 @@ class ImprovedGeometricDetector:
         """
         detections = []
         
-        contours = self.find_all_contours(image)
+        h, w = image.shape[:2]
         
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            
-            if area < self.min_area or area > self.max_area:
-                continue
+        contours, contour_info_list = self.find_all_contours(image)
+        
+        for cnt, info in zip(contours, contour_info_list):
+            area = info['area']
             
             shape_features = self.get_shape_features(cnt)
             color_features = self.get_color_features(image, cnt)
@@ -364,6 +394,9 @@ class ImprovedGeometricDetector:
                 sift_sim = self.compute_sift_similarity(sift_features, ref_obj['sift_features'])
                 overall_sim = self.compute_overall_similarity(shape_sim, color_sim, sift_sim)
                 
+                if info['is_edge']:
+                    overall_sim = overall_sim * 0.9
+                
                 if overall_sim > max_similarity:
                     max_similarity = overall_sim
                     best_match_idx = ref_idx
@@ -374,7 +407,8 @@ class ImprovedGeometricDetector:
                     'similarity': float(max_similarity),
                     'source_img': int(source_img_idx),
                     'contour_area': float(area),
-                    'best_match_ref': best_match_idx
+                    'best_match_ref': best_match_idx,
+                    'is_edge': info['is_edge']
                 }
                 detections.append(detection)
         
@@ -385,11 +419,16 @@ class ImprovedGeometricDetector:
     def _remove_duplicate_detections(self, detections, iou_threshold=0.5):
         """
         去除重复的检测结果（非极大值抑制）
+        优先保留非边缘物体和相似度高的物体
         """
         if len(detections) == 0:
             return []
         
-        detections = sorted(detections, key=lambda x: x['similarity'], reverse=True)
+        def sort_key(det):
+            edge_penalty = 0.0 if not det.get('is_edge', False) else 0.5
+            return det['similarity'] - edge_penalty
+        
+        detections = sorted(detections, key=sort_key, reverse=True)
         
         keep = []
         while detections:
@@ -436,14 +475,21 @@ class ImprovedGeometricDetector:
         for det in detections:
             box = det['box']
             similarity = det['similarity']
+            is_edge = det.get('is_edge', False)
             
             x, y, w, h = box
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
             
-            text = f"{similarity:.2f}"
+            color = (0, 0, 255)
+            if is_edge:
+                color = (0, 165, 255)
+            
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+            
+            edge_label = " [边缘]" if is_edge else ""
+            text = f"{similarity:.2f}{edge_label}"
             text_y = y - 10 if y - 10 > 10 else y + h + 20
             cv2.putText(annotated, text, (x, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         return annotated
 
